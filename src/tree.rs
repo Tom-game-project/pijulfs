@@ -2,7 +2,7 @@ use fuser::{
     FileAttr, INodeNo
 };
 
-use std::{collections::{HashMap, hash_map::Iter}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{BTreeMap, btree_map::Iter}, time::{SystemTime, UNIX_EPOCH}};
 
 const NOW:SystemTime = UNIX_EPOCH;
 
@@ -16,7 +16,7 @@ pub enum StateInMem {
     Dir {
         dir_name: String,
         file_attr: FileAttr,
-        childs: HashMap<INodeNo, StateInMem>
+        childs: BTreeMap<INodeNo, StateInMem>
     },
     LazyDir {
         dir_name: String,
@@ -26,9 +26,9 @@ pub enum StateInMem {
         file_name: String,
         file_attr: FileAttr
     },
+    Resolving
 }
 
-#[cfg(test)]
 impl std::fmt::Display for StateInMem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn build_tree(node: &StateInMem, depth: usize, ino: Option<&INodeNo>) -> String {
@@ -62,6 +62,9 @@ impl std::fmt::Display for StateInMem {
                 StateInMem::LazyFile { file_name, .. } => {
                     format!("{}{}lazyfile \"{}\"", indent, prefix, file_name)
                 }
+                StateInMem::Resolving => {
+                    format!("")
+                }
             }
         }
 
@@ -70,18 +73,45 @@ impl std::fmt::Display for StateInMem {
 }
 
 pub trait LazyResolver { 
-    // fn gen_new_inode(&mut self) -> INodeNo;
+    type Tree;
+    type Inode;
+
+    fn gen_new_inode(&mut self) -> INodeNo;
     // fn gen_file_contents(&self) -> String /* TODO */;
-    fn gen_children(&mut self) -> HashMap<INodeNo, StateInMem>;
+    fn init(&mut self, target: &Self::Tree) {}
+
+    // 遅延的にディレクトリの子要素を生成する
+    fn gen_children(&mut self, target: &Self::Tree) -> BTreeMap<Self::Inode, Self::Tree>;
 }
 
 impl StateInMem {
-    fn get_fileattr(&self) -> &FileAttr {
+    pub fn get_fileattr(&self) -> Option<&FileAttr> {
         match self {
-            Self::Dir { file_attr, .. } => file_attr,
-            Self::File { file_attr, .. } => file_attr,
-            Self::LazyDir {  file_attr, .. } => file_attr,
-            Self::LazyFile { file_attr, .. } => file_attr,
+            Self::Dir      { file_attr, .. } => Some(file_attr),
+            Self::File     { file_attr, .. } => Some(file_attr),
+            Self::LazyDir  { file_attr, .. } => Some(file_attr),
+            Self::LazyFile { file_attr, .. } => Some(file_attr),
+            Self::Resolving => None
+        }
+    }
+
+    pub fn get_name(&self) -> Option<&String> {
+        match self {
+            Self::Dir      { dir_name, .. } => Some(dir_name),
+            Self::File     { file_name, .. } => Some(file_name),
+            Self::LazyDir  { dir_name, .. } => Some(dir_name),
+            Self::LazyFile { file_name, .. } => Some(file_name),
+            Self::Resolving => None,
+        }
+    }
+
+    pub fn get_name_and_fileattr(&self) -> Option<(&String, &FileAttr)> {
+        match self {
+            Self::Dir      {  file_attr, dir_name, ..  } => Some((dir_name , file_attr)),
+            Self::File     {  file_attr, file_name, .. } => Some((file_name, file_attr)),
+            Self::LazyDir  {  file_attr, dir_name, ..  } => Some((dir_name , file_attr)),
+            Self::LazyFile {  file_attr, file_name, .. } => Some((file_name, file_attr)),
+            Self::Resolving => None,
         }
     }
 
@@ -91,6 +121,8 @@ impl StateInMem {
             Self::Dir { childs , .. } => {
                 if let Some(a) = childs.get(&target_ino) {
                     Some(a)
+                } else if target_ino == INodeNo::ROOT && self.get_fileattr().unwrap().ino == INodeNo::ROOT {
+                    Some(self)
                 } else {
                     childs
                         .iter()
@@ -105,84 +137,69 @@ impl StateInMem {
     }
 
     /// for lookup function
-    pub fn get_file_obj_with_parent(&self, cur_ino: &INodeNo, parent_ino: &INodeNo, name: &str) -> Option<&FileAttr> {
+    pub fn get_file_obj_with_parent(&self, cur_ino: &INodeNo, parent_ino: &INodeNo, target_parent_ino: &INodeNo, name: &str) -> Option<&FileAttr> {
+        println!("cur_ino {:?} parent_ino {:?} target_parent_ino {:?}| {}", cur_ino, parent_ino, target_parent_ino, name);
         match &self {
             Self::File { file_name, file_attr, .. } => {
-                if cur_ino == parent_ino && file_name == name {
+                if target_parent_ino == parent_ino && file_name == name {
                     Some(file_attr)
                 } else {
                     None
                 }
             }
-            Self::Dir { childs , .. } => {
-                childs
-                    .iter()
-                    .find_map(|(cur_ino, stateinmem)| stateinmem.get_file_obj_with_parent(cur_ino, parent_ino, name))
-            }
-            Self::LazyFile { file_name, file_attr } => {
-                if cur_ino == parent_ino && file_name == name {
+            Self::Dir { dir_name, file_attr, childs } => {
+                if target_parent_ino == parent_ino && dir_name == name {
                     Some(file_attr)
-                } else {
-                    None
-                }
-            }
-            Self::LazyDir { .. } => {
-                None
-            }
-        }
-    }
-
-    pub fn get_crrent_dir<R>(&mut self, cur_ino: &INodeNo, ino: &INodeNo, resolver: &mut R) -> Option<Iter<'_, INodeNo, StateInMem>> 
-    where R: LazyResolver
-    {
-        match self {
-            Self::Dir { childs, .. } => {
-                if cur_ino == ino {
-                    Some(childs.iter())
                 } else {
                     childs
-                        .iter_mut()
-                        .find_map(|(cur_ino, stateinmem)| stateinmem.get_crrent_dir(cur_ino, ino, resolver))
+                        .iter()
+                        .find_map(|(cino, stateinmem)| stateinmem.get_file_obj_with_parent(cino, cur_ino, target_parent_ino, name))
+                }
+            }
+            Self::LazyFile { file_name, file_attr } => {
+                if target_parent_ino == parent_ino && file_name == name {
+                    Some(file_attr)
+                } else {
+                    None
                 }
             }
             Self::LazyDir { dir_name, file_attr } => {
-                let childs = resolver.gen_children();
-
-                *self = StateInMem::Dir { 
-                    dir_name: dir_name.to_string(), 
-                    file_attr: *file_attr,
-                    childs
-                };
-                match self {
-                    Self::Dir { childs , .. } => {
-                        Some(childs.iter())
-                    }
-                    _ => None
+                if target_parent_ino == parent_ino && dir_name == name {
+                    Some(file_attr)
+                } else {
+                    None
                 }
             }
-            _ => {
+            Self::Resolving => {
                 None
             }
         }
     }
 
-    pub fn get_crrent_dir2<R>(&mut self, target_ino: &INodeNo, resolver: &mut R) -> Option<Iter<'_, INodeNo, StateInMem>> 
-    where R: LazyResolver
+    pub fn get_crrent_dir<R>(&mut self, target_ino: &INodeNo, resolver: &mut R) -> Option<Iter<'_, INodeNo, StateInMem>> 
+    where R: LazyResolver<Tree = Self, Inode = INodeNo>
     {
         let mut stack: Vec<(&INodeNo, &mut StateInMem)> = Vec::new();
 
-        let ino = self.get_fileattr().ino;
+        let ino = self
+            .get_fileattr()
+            .unwrap() // unreachable
+            .ino;
+
         stack.push((&ino, self));
-
         while let Some((current_ino, state)) = stack.pop() {
-            if let Self::LazyDir { dir_name, file_attr } = state {
-                let childs = resolver.gen_children();
+            if matches!(state, Self::LazyDir { .. }) {
+                let old = std::mem::replace(state, StateInMem::Resolving);
+                let childs = resolver.gen_children(&old);
 
-                *state = StateInMem::Dir { 
-                    dir_name: dir_name.to_string(), 
-                    file_attr: *file_attr,
-                    childs
-                };
+                if let Self::LazyDir { dir_name, file_attr } = old {
+
+                    *state = StateInMem::Dir { 
+                        dir_name: dir_name.to_string(), 
+                        file_attr: file_attr,
+                        childs
+                    };
+                }
             }
 
             if let Self::Dir { childs, .. } = state {
@@ -197,6 +214,33 @@ impl StateInMem {
         }
         None
     }
+
+    pub fn get_parent_inode_of(&self, target_ino: &INodeNo) -> Option<INodeNo> {
+        if target_ino == &INodeNo::ROOT {
+            Some(INodeNo::ROOT)
+        } else {
+            let mut stack: Vec<(&INodeNo, &INodeNo, &StateInMem)> = Vec::new();
+
+            let ino = self
+                .get_fileattr()
+                .unwrap() // unreachable
+                .ino;
+
+            stack.push((&ino, &ino, self));
+
+            while let Some((parent_ino, current_ino, state)) = stack.pop() {
+                if current_ino == target_ino {
+                    return Some(*parent_ino);
+                }
+                if let Self::Dir { childs, .. } = state {
+                    for i in childs {
+                        stack.push((current_ino, i.0, i.1));
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
 
@@ -208,7 +252,7 @@ mod tree_test {
         FileAttr, FileType, INodeNo
     };
 
-    use std::{collections::HashMap, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use std::{collections::BTreeMap, time::{Duration, SystemTime, UNIX_EPOCH}};
 
     const ROOT_DIR_INO: u64 = 1;
     const SUB_DIR_INO: u64 = 4;
@@ -317,7 +361,7 @@ mod tree_test {
                             }
                         },
                         )
-                    ].iter().fold(HashMap::new(), |mut acc, (k, v)| {
+                    ].iter().fold(BTreeMap::new(), |mut acc, (k, v)| {
                         acc.insert(k.clone(), v.clone()); 
                         acc
                     })
@@ -346,21 +390,34 @@ mod tree_test {
                     }
                 }
                 )
-            ].iter().fold(HashMap::new(), |mut acc, (k, v)| {acc.insert(k.clone(), v.clone()); acc})};
+            ].iter().fold(BTreeMap::new(), |mut acc, (k, v)| {acc.insert(k.clone(), v.clone()); acc})};
         tree
     }
 
-    struct TestResolver;
+    struct TestResolver {
+        max_inode: u64,
+
+    }
 
     impl LazyResolver for TestResolver {
-        fn gen_children(&mut self, ) -> HashMap<INodeNo, StateInMem> {
-            let mut r_hash_map = HashMap::new();
+        type Tree = StateInMem;
+        type Inode = INodeNo;
+
+        fn gen_new_inode (&mut self) -> Self::Inode {
+            self.max_inode += 1;
+            INodeNo(self.max_inode)
+        }
+
+        fn gen_children(&mut self, tree: &Self::Tree) -> BTreeMap<Self::Inode, Self::Tree> {
+            let mut r_hash_map = BTreeMap::new();
+            println!("gen_children: tree: {}", tree);
+            let new_inode = self.gen_new_inode();
             r_hash_map.insert(
-                INodeNo(LAZY_FILE_INO), 
+                new_inode,
                 StateInMem::LazyFile {
                     file_name: "lazy.txt".to_string(),
                     file_attr:  FileAttr {
-                        ino: INodeNo(LAZY_FILE_INO),
+                        ino: new_inode,
                         size: WORLD_CONTENT.len() as u64,
                         blocks: 1,
                         atime: NOW,
@@ -381,7 +438,7 @@ mod tree_test {
         }
     }
 
-    fn debug_print_dir(dir_children: &HashMap<INodeNo, StateInMem>) {
+    fn debug_print_dir(dir_children: &BTreeMap<INodeNo, StateInMem>) {
         for (ino, stateinmem) in dir_children {
             println!("ino{:?} name {}", ino, stateinmem);
         }
@@ -390,9 +447,7 @@ mod tree_test {
     #[test]
     fn test00() {
         let mut tree = set_up_test_tree();
-        let mut test_resolver = TestResolver{};
-
-        // println!("{:#?}", tree);
+        let mut test_resolver = TestResolver{ max_inode: 10 };
 
         match &tree {
             StateInMem::Dir { dir_name, file_attr, childs } => {
@@ -400,9 +455,27 @@ mod tree_test {
             }
             _ => {}
         }
-        
+
         println!("-----------------------------------------------------------------");
-        if let Some(a) = tree.get_crrent_dir2(&INodeNo(LAZY_DIR_INO), &mut test_resolver) {
+        if let Some(a) = tree.get_crrent_dir(&INodeNo::ROOT, &mut test_resolver) {
+            for (ino, sim) in a {
+                println!("ino: {:?}, {}", ino, sim);
+            }
+        }
+        println!("-----------------------------------------------------------------");
+        if let Some(a) = tree.get_crrent_dir(&INodeNo::ROOT, &mut test_resolver) {
+            for (ino, sim) in a {
+                println!("ino: {:?}, {}", ino, sim);
+            }
+        }
+        println!("-----------------------------------------------------------------");
+        if let Some(a) = tree.get_crrent_dir(&INodeNo(LAZY_DIR_INO), &mut test_resolver) {
+            for (ino, sim) in a {
+                println!("ino: {:?}, {}", ino, sim);
+            }
+        }
+        println!("-----------------------------------------------------------------");
+        if let Some(a) = tree.get_crrent_dir(&INodeNo::ROOT, &mut test_resolver) {
             for (ino, sim) in a {
                 println!("ino: {:?}, {}", ino, sim);
             }
@@ -414,5 +487,7 @@ mod tree_test {
             }
             _ => {}
         }
+        println!("parent ino {}", tree.get_parent_inode_of(&INodeNo(11)).expect("parent not found"));
+
     }
 }
