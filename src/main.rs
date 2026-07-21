@@ -1,13 +1,19 @@
+mod tree;
+use tree::*;
+
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
 
-use std::{ffi::OsStr, time::{Duration, UNIX_EPOCH}};
+use std::{collections::HashMap, ffi::OsStr, sync::RwLock, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 const ROOT_DIR_INO: u64 = 1;
 const SUB_DIR_INO: u64 = 4;
 const HELLO_FILE_INO: u64 = 2;
 const WORLD_FILE_INO: u64 = 3;
+const LAZY_DIR_INO: u64 = 5;
+const LAZY_FILE_INO: u64 = 6;
+
 const HELLO_FILE_NAME: &str = "hello.txt";
 const WORLD_FILE_NAME: &str = "world.txt";
 const SUB_DIR_NAME: &str = "subdir";
@@ -16,82 +22,39 @@ const WORLD_CONTENT: &str = "World, FUSE with Rust!\n";
 
 const TTL: Duration = Duration::from_secs(1);
 
-struct MemoryFileSystem;
+const NOW:SystemTime = UNIX_EPOCH;
+
+struct MemoryFileSystem{
+    stete_in_mem: RwLock<StateInMem>,
+}
 
 impl MemoryFileSystem {
-    fn get_attribute(&self, ino: u64) -> Option<FileAttr> {
-        let now = UNIX_EPOCH;
-
-        match ino {
-            ROOT_DIR_INO => Some(FileAttr {
-                ino: INodeNo::ROOT,
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::Directory,
-                perm: 0o755, // rwxr-xr-x
-                nlink: 3,    // "." ".." "subdir"
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            }),
-            SUB_DIR_INO => Some(FileAttr {
-                ino: INodeNo(SUB_DIR_INO),
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::Directory,
-                perm: 0o755, // rwxr-xr-x
-                nlink: 2,    // "." ".."
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            }),
-            HELLO_FILE_INO => Some(FileAttr {
-                ino: INodeNo(HELLO_FILE_INO),
-                size: HELLO_CONTENT.len() as u64,
-                blocks: 1,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::RegularFile,
-                perm: 0o644, // rw-r--r--
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            }),
-            WORLD_FILE_INO => Some(FileAttr {
-                ino: INodeNo(WORLD_FILE_INO),
-                size: WORLD_CONTENT.len() as u64,
-                blocks: 1,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::RegularFile,
-                perm: 0o644, // rw-r--r--
-                nlink: 1,
-                uid: 1000,
-                gid: 1000,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            }),
-            _ => None,
+    fn get_attribute(&self, ino: INodeNo) -> Option<FileAttr> {
+        match self.stete_in_mem.read() {
+            Ok(v) => {
+                if let Some(stateinmem) = v.get_file_obj(ino) {
+                    match stateinmem {
+                        StateInMem::Dir { dir_name: _, file_attr, childs: _ } => {
+                            Some(file_attr.clone())
+                        }
+                        StateInMem::File { file_name: _, file_attr, contents: _ } => {
+                            Some(file_attr.clone())
+                        }
+                        StateInMem::LazyDir { dir_name: _, file_attr } => {
+                            Some(file_attr.clone())
+                        }
+                        StateInMem::LazyFile { file_name: _, file_attr } => {
+                            Some(file_attr.clone())
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(e) => {
+                println!("{:?}", e);
+                None
+            }
         }
     }
 }
@@ -100,28 +63,15 @@ impl Filesystem for MemoryFileSystem {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         println!("[FUSE] lookup called: parent={}, name={:?}", parent, name);
 
-        if parent == INodeNo::ROOT {
-            if name.to_str() == Some(HELLO_FILE_NAME) {
-                if let Some(attr) = self.get_attribute(HELLO_FILE_INO) {
-                    reply.entry(&TTL, &attr, Generation(0));
+        match self.stete_in_mem.read() {
+            Ok(v) => {
+                if let Some(attr) = v.get_file_obj_with_parent(&INodeNo::ROOT, &parent, &name.to_string_lossy()) {
+                    reply.entry(&TTL, attr, Generation(0));
                     return;
                 }
-            } else if name.to_str() == Some(SUB_DIR_NAME) {
-                if let Some(attr) = self.get_attribute(SUB_DIR_INO) {
-                    reply.entry(&TTL, &attr, Generation(0));
-                    return;
-                }
-            } else {
-                println!("name.to_str() = {:?}", name.to_str());
             }
-        } else if parent == INodeNo(SUB_DIR_INO) {
-            if name.to_str() == Some(WORLD_FILE_NAME) {
-                if let Some(attr) = self.get_attribute(WORLD_FILE_INO) {
-                    reply.entry(&TTL, &attr, Generation(0));
-                    return;
-                }
-            } else {
-                println!("name.to_str() = {:?}", name.to_str());
+            Err(e) => {
+                println!("{:?}", e);
             }
         }
         reply.error(Errno::ENOENT);
@@ -130,7 +80,7 @@ impl Filesystem for MemoryFileSystem {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
          println!("[FUSE] getattr called: ino={}", ino);
 
-         if let Some(attr) = self.get_attribute(ino.0) {
+         if let Some(attr) = self.get_attribute(ino) {
              reply.attr(&TTL, &attr);
          } else {
              reply.error(Errno::ENOENT);
@@ -220,6 +170,127 @@ fn main() {
     config.n_threads = Some(4);
     config.clone_fd = true;
 
+    let tree = StateInMem::Dir {
+
+        dir_name: "root".to_string(),
+        file_attr: FileAttr {
+            ino: INodeNo::ROOT,
+            size: 0,
+            blocks: 0,
+            atime: NOW,
+            mtime: NOW,
+            ctime: NOW,
+            crtime: NOW,
+            kind: FileType::Directory,
+            perm: 0o755, // rwxr-xr-x
+            nlink: 3,    // "." ".." "subdir"
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        },
+
+        childs: vec![
+            (INodeNo(HELLO_FILE_INO), StateInMem::LazyFile { 
+                file_name: "hello.txt".to_string(), 
+                file_attr: FileAttr {
+                    ino: INodeNo(HELLO_FILE_INO),
+                    size: HELLO_CONTENT.len() as u64,
+                    blocks: 1,
+                    atime: NOW,
+                    mtime: NOW,
+                    ctime: NOW,
+                    crtime: NOW,
+                    kind: FileType::RegularFile,
+                    perm: 0o644, // rw-r--r--
+                    nlink: 1,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 512,
+                    flags: 0,
+                }
+            }),
+
+            (
+            INodeNo(SUB_DIR_INO),
+            StateInMem::Dir {
+                dir_name: "subdir".to_string(), 
+                file_attr:  FileAttr {
+                    ino: INodeNo(SUB_DIR_INO),
+                    size: 0,
+                    blocks: 0,
+                    atime: NOW,
+                    mtime: NOW,
+                    ctime: NOW,
+                    crtime: NOW,
+                    kind: FileType::Directory,
+                    perm: 0o755, // rwxr-xr-x
+                    nlink: 2,    // "." ".."
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 512,
+                    flags: 0,
+                },
+
+                childs: vec![
+                    (
+                    INodeNo(LAZY_FILE_INO),
+                    StateInMem::LazyFile {
+                        file_name: "lazy.txt".to_string(),
+                        file_attr:  FileAttr {
+                            ino: INodeNo(LAZY_FILE_INO),
+                            size: WORLD_CONTENT.len() as u64,
+                            blocks: 1,
+                            atime: NOW,
+                            mtime: NOW,
+                            ctime: NOW,
+                            crtime: NOW,
+                            kind: FileType::RegularFile,
+                            perm: 0o644, // rw-r--r--
+                            nlink: 1,
+                            uid: 1000,
+                            gid: 1000,
+                            rdev: 0,
+                            blksize: 512,
+                            flags: 0,
+                        }
+                    },
+                    )
+                ].iter().fold(HashMap::new(), |mut acc, (k, v)| {
+                    acc.insert(k.clone(), v.clone()); 
+                    acc
+                })
+            }),
+
+            (
+            INodeNo(LAZY_DIR_INO),
+            StateInMem::LazyDir { 
+                dir_name: "lazydir".to_string(),
+                file_attr: FileAttr {
+                    ino: INodeNo(LAZY_DIR_INO),
+                    size: 0,
+                    blocks: 0,
+                    atime: NOW,
+                    mtime: NOW,
+                    ctime: NOW,
+                    crtime: NOW,
+                    kind: FileType::Directory,
+                    perm: 0o755, // rwxr-xr-x
+                    nlink: 2,    // "." ".."
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 512,
+                    flags: 0,
+                }
+            }
+            )
+        ].iter().fold(HashMap::new(), |mut acc, (k, v)| {acc.insert(k.clone(), v.clone()); acc})};
+
+
     println!("Mounting FileSystem at {}...", mountpoint);
-    fuser::mount2(MemoryFileSystem, mountpoint, &config).unwrap();
+    fuser::mount2(MemoryFileSystem{ stete_in_mem: RwLock::new(tree) }, mountpoint, &config).unwrap();
 }
