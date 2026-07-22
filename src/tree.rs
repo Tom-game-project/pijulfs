@@ -76,12 +76,10 @@ pub trait LazyResolver {
     type Tree;
     type Inode;
 
+    /// generate new inode
     fn gen_new_inode(&mut self) -> INodeNo;
-    // fn gen_file_contents(&self) -> String /* TODO */;
-    fn init(&mut self, target: &Self::Tree) {}
-
     // 遅延的にディレクトリの子要素を生成する
-    fn gen_children(&mut self, target: &Self::Tree) -> BTreeMap<Self::Inode, Self::Tree>;
+    fn gen_children(&mut self, parent_ino: &Self::Inode) -> BTreeMap<Self::Inode, Self::Tree>;
 }
 
 impl StateInMem {
@@ -117,12 +115,13 @@ impl StateInMem {
 
     /// return resolved stateinmem tree.
     pub fn get_file_obj(&self, target_ino: INodeNo /*already generated*/) -> Option<&StateInMem> {
+        if target_ino == INodeNo::ROOT && self.get_fileattr().unwrap().ino == INodeNo::ROOT {
+            return Some(self);
+        }
         match &self {
             Self::Dir { childs , .. } => {
                 if let Some(a) = childs.get(&target_ino) {
                     Some(a)
-                } else if target_ino == INodeNo::ROOT && self.get_fileattr().unwrap().ino == INodeNo::ROOT {
-                    Some(self)
                 } else {
                     childs
                         .iter()
@@ -137,60 +136,87 @@ impl StateInMem {
     }
 
     /// for lookup function
-    pub fn get_file_obj_with_parent(&self, cur_ino: &INodeNo, parent_ino: &INodeNo, target_parent_ino: &INodeNo, name: &str) -> Option<&FileAttr> {
-        println!("cur_ino {:?} parent_ino {:?} target_parent_ino {:?}| {}", cur_ino, parent_ino, target_parent_ino, name);
-        match &self {
-            Self::File { file_name, file_attr, .. } => {
-                if target_parent_ino == parent_ino && file_name == name {
-                    Some(file_attr)
-                } else {
-                    None
-                }
-            }
-            Self::Dir { dir_name, file_attr, childs } => {
-                if target_parent_ino == parent_ino && dir_name == name {
-                    Some(file_attr)
-                } else {
-                    childs
-                        .iter()
-                        .find_map(|(cino, stateinmem)| stateinmem.get_file_obj_with_parent(cino, cur_ino, target_parent_ino, name))
-                }
-            }
-            Self::LazyFile { file_name, file_attr } => {
-                if target_parent_ino == parent_ino && file_name == name {
-                    Some(file_attr)
-                } else {
-                    None
-                }
-            }
-            Self::LazyDir { dir_name, file_attr } => {
-                if target_parent_ino == parent_ino && dir_name == name {
-                    Some(file_attr)
-                } else {
-                    None
-                }
-            }
-            Self::Resolving => {
-                None
-            }
-        }
-    }
-
-    pub fn get_crrent_dir<R>(&mut self, target_ino: &INodeNo, resolver: &mut R) -> Option<Iter<'_, INodeNo, StateInMem>> 
-    where R: LazyResolver<Tree = Self, Inode = INodeNo>
-    {
-        let mut stack: Vec<(&INodeNo, &mut StateInMem)> = Vec::new();
+    /// 親のinodeと、名前から条件を満たすディレクトリを探索する
+    pub fn get_file_obj_with_parent<R>(&mut self, target_parent_ino: &INodeNo, name: &str, resolver: &mut R) -> Option<&FileAttr> 
+    where R: LazyResolver<Tree = Self, Inode = INodeNo>{
+        let mut stack: Vec<(&INodeNo /*parent_ino*/, &INodeNo/*current_ino*/, &mut StateInMem)> = Vec::new();
 
         let ino = self
             .get_fileattr()
             .unwrap() // unreachable
             .ino;
 
-        stack.push((&ino, self));
-        while let Some((current_ino, state)) = stack.pop() {
+        stack.push((&ino, &ino, self));
+
+        while let Some((parent_ino, current_ino, state)) = stack.pop() {
+
+            if matches!(state, Self::LazyDir { dir_name, .. } if dir_name == name) && target_parent_ino == parent_ino {
+                let old = std::mem::replace(state, StateInMem::Resolving);
+                let childs = resolver.gen_children(parent_ino);
+
+                if let Self::LazyDir { dir_name, file_attr } = old {
+                    *state = StateInMem::Dir { 
+                        dir_name: dir_name.to_string(), 
+                        file_attr: file_attr,
+                        childs
+                    };
+                    return state.get_fileattr();
+                }
+                // unreachable
+            }
+
+            match state {
+                Self::File { file_name, file_attr, .. } => {
+                    if target_parent_ino == parent_ino && file_name == name {
+                        return Some(file_attr);
+                    } 
+                }
+                Self::Dir { dir_name, file_attr, childs } => {
+                    if target_parent_ino == parent_ino && dir_name == name {
+                        return Some(file_attr);
+                    } else {
+                        for i in childs {
+                            stack.push((current_ino, i.0, i.1));
+                        }
+                    }
+                }
+                Self::LazyFile { file_name, file_attr } => {
+                    if target_parent_ino == parent_ino && file_name == name {
+                        return Some(file_attr);
+                    }
+                }
+                Self::LazyDir { dir_name, file_attr } => {
+                    // unreachable
+
+                    // if target_parent_ino == parent_ino && dir_name == name {
+                    //     return Some(file_attr);
+                    // }
+                }
+                Self::Resolving => {
+                    break;
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn get_crrent_dir<R>(&mut self, target_ino: &INodeNo, resolver: &mut R) -> Option<Iter<'_, INodeNo, StateInMem>> 
+    where R: LazyResolver<Tree = Self, Inode = INodeNo>
+    {
+        let mut stack: Vec<(&INodeNo /* parent_ino */, &INodeNo /* current_ino */, &mut StateInMem)> = Vec::new();
+
+        let ino = self
+            .get_fileattr()
+            .unwrap() // unreachable
+            .ino;
+
+        stack.push((&ino, &ino, self));
+
+        while let Some((parent_ino, current_ino, state)) = stack.pop() {
             if matches!(state, Self::LazyDir { .. }) {
                 let old = std::mem::replace(state, StateInMem::Resolving);
-                let childs = resolver.gen_children(&old);
+                let childs = resolver.gen_children(parent_ino);
 
                 if let Self::LazyDir { dir_name, file_attr } = old {
 
@@ -207,7 +233,7 @@ impl StateInMem {
                     return Some(childs.iter());
                 } else {
                     for i in childs {
-                        stack.push(i);
+                        stack.push((current_ino, i.0, i.1));
                     }
                 }
             }
@@ -219,7 +245,7 @@ impl StateInMem {
         if target_ino == &INodeNo::ROOT {
             Some(INodeNo::ROOT)
         } else {
-            let mut stack: Vec<(&INodeNo, &INodeNo, &StateInMem)> = Vec::new();
+            let mut stack: Vec<(&INodeNo /* parent_ino */, &INodeNo /* current_ino */, &StateInMem)> = Vec::new();
 
             let ino = self
                 .get_fileattr()
@@ -408,9 +434,10 @@ mod tree_test {
             INodeNo(self.max_inode)
         }
 
-        fn gen_children(&mut self, tree: &Self::Tree) -> BTreeMap<Self::Inode, Self::Tree> {
+        // 引数はparent inodeにするのがいいかもしれない
+        fn gen_children(&mut self, parent_ino: &Self::Inode) -> BTreeMap<Self::Inode, Self::Tree> {
             let mut r_hash_map = BTreeMap::new();
-            println!("gen_children: tree: {}", tree);
+            println!("gen_children: tree: {}", parent_ino);
             let new_inode = self.gen_new_inode();
             r_hash_map.insert(
                 new_inode,

@@ -37,9 +37,9 @@ impl LazyResolver for TestResolver {
         INodeNo(self.max_inode)
     }
 
-    fn gen_children(&mut self, tree: &Self::Tree) -> BTreeMap<Self::Inode, Self::Tree> {
+    fn gen_children(&mut self, parent_ino: &Self::Inode) -> BTreeMap<Self::Inode, Self::Tree> {
         let mut r_hash_map = BTreeMap::new();
-        println!("gen_children: tree: {}", tree);
+        println!("gen_children: parent inode: {}", parent_ino);
         let new_inode = self.gen_new_inode();
         r_hash_map.insert(
             new_inode,
@@ -56,6 +56,30 @@ impl LazyResolver for TestResolver {
                     kind: FileType::RegularFile,
                     perm: 0o644, // rw-r--r--
                     nlink: 1,
+                    uid: 1000,
+                    gid: 1000,
+                    rdev: 0,
+                    blksize: 512,
+                    flags: 0,
+                }
+            });
+
+        let new_inode = self.gen_new_inode();
+        r_hash_map.insert(
+            new_inode,
+            StateInMem::LazyDir { 
+                dir_name: "lazydir".to_string(), 
+                file_attr: FileAttr {
+                    ino: new_inode,
+                    size: 0,
+                    blocks: 0,
+                    atime: NOW,
+                    mtime: NOW,
+                    ctime: NOW,
+                    crtime: NOW,
+                    kind: FileType::Directory,
+                    perm: 0o755, // rwxr-xr-x
+                    nlink: 3,    // "." ".." "subdir"
                     uid: 1000,
                     gid: 1000,
                     rdev: 0,
@@ -119,17 +143,25 @@ impl Filesystem for MemoryFileSystem {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         println!("[FUSE] lookup called: parent={}, name={:?}", parent, name);
 
-        match self.stete_in_mem.read() {
-            Ok(v) => {
-                if let Some(attr) = v.get_file_obj_with_parent(&INodeNo::ROOT, &INodeNo::ROOT,&parent ,&name.to_string_lossy()) {
-                    reply.entry(&TTL, attr, Generation(0));
-                    return;
-                } else {
-                    println!("Debug: not found");
+        match self.resolver.lock() { // <------ lock: resolver
+            Ok(mut resolver) => {
+                match self.stete_in_mem.write() {
+                    Ok(mut v) => {
+                        if let Some(attr) = v.get_file_obj_with_parent(&parent, &name.to_string_lossy(), &mut *resolver) 
+                        {
+                            reply.entry(&TTL, attr, Generation(0));
+                            return;
+                        } else {
+                            println!("Debug: not found -> parent inode {}, name {}", parent, name.to_string_lossy());
+                        }
+                    }
+                    Err(e) => {
+                        println!("{:?}", e);
+                    }
                 }
-            }
+            } 
             Err(e) => {
-                println!("{:?}", e);
+
             }
         }
         reply.error(Errno::ENOENT);
@@ -249,8 +281,7 @@ fn main() {
     config.n_threads = Some(4);
     config.clone_fd = true;
 
-    let tree = StateInMem::Dir {
-
+    let tree = StateInMem::LazyDir {
         dir_name: "root".to_string(),
         file_attr: FileAttr {
             ino: INodeNo::ROOT,
@@ -268,108 +299,8 @@ fn main() {
             rdev: 0,
             blksize: 512,
             flags: 0,
-        },
-
-        childs: vec![
-            (INodeNo(HELLO_FILE_INO), StateInMem::LazyFile { 
-                file_name: "hello.txt".to_string(), 
-                file_attr: FileAttr {
-                    ino: INodeNo(HELLO_FILE_INO),
-                    size: HELLO_CONTENT.len() as u64,
-                    blocks: 1,
-                    atime: NOW,
-                    mtime: NOW,
-                    ctime: NOW,
-                    crtime: NOW,
-                    kind: FileType::RegularFile,
-                    perm: 0o644, // rw-r--r--
-                    nlink: 1,
-                    uid: 1000,
-                    gid: 1000,
-                    rdev: 0,
-                    blksize: 512,
-                    flags: 0,
-                }
-            }),
-
-            (
-            INodeNo(SUB_DIR_INO),
-            StateInMem::Dir {
-                dir_name: "subdir".to_string(), 
-                file_attr:  FileAttr {
-                    ino: INodeNo(SUB_DIR_INO),
-                    size: 0,
-                    blocks: 0,
-                    atime: NOW,
-                    mtime: NOW,
-                    ctime: NOW,
-                    crtime: NOW,
-                    kind: FileType::Directory,
-                    perm: 0o755, // rwxr-xr-x
-                    nlink: 2,    // "." ".."
-                    uid: 1000,
-                    gid: 1000,
-                    rdev: 0,
-                    blksize: 512,
-                    flags: 0,
-                },
-
-                childs: vec![
-                    (
-                    INodeNo(LAZY_FILE_INO),
-                    StateInMem::LazyFile {
-                        file_name: "world.txt".to_string(),
-                        file_attr:  FileAttr {
-                            ino: INodeNo(LAZY_FILE_INO),
-                            size: WORLD_CONTENT.len() as u64,
-                            blocks: 1,
-                            atime: NOW,
-                            mtime: NOW,
-                            ctime: NOW,
-                            crtime: NOW,
-                            kind: FileType::RegularFile,
-                            perm: 0o644, // rw-r--r--
-                            nlink: 1,
-                            uid: 1000,
-                            gid: 1000,
-                            rdev: 0,
-                            blksize: 512,
-                            flags: 0,
-                        }
-                    },
-                    )
-                ].iter().fold(BTreeMap::new(), |mut acc, (k, v)| {
-                    acc.insert(k.clone(), v.clone()); 
-                    acc
-                })
-            }),
-
-            (
-            INodeNo(LAZY_DIR_INO),
-            StateInMem::LazyDir { 
-                dir_name: "lazydir".to_string(),
-                file_attr: FileAttr {
-                    ino: INodeNo(LAZY_DIR_INO),
-                    size: 0,
-                    blocks: 0,
-                    atime: NOW,
-                    mtime: NOW,
-                    ctime: NOW,
-                    crtime: NOW,
-                    kind: FileType::Directory,
-                    perm: 0o755, // rwxr-xr-x
-                    nlink: 2,    // "." ".."
-                    uid: 1000,
-                    gid: 1000,
-                    rdev: 0,
-                    blksize: 512,
-                    flags: 0,
-                }
-            }
-            )
-        ].iter().fold(BTreeMap::new(), |mut acc, (k, v)| {acc.insert(k.clone(), v.clone()); acc})};
-
+        }};
 
     println!("Mounting FileSystem at {}...", mountpoint);
-    fuser::mount2(MemoryFileSystem{ resolver: TestResolver { max_inode: 10 }.into() ,stete_in_mem: RwLock::new(tree) }, mountpoint, &config).unwrap();
+    fuser::mount2(MemoryFileSystem{ resolver: TestResolver { max_inode: ROOT_DIR_INO }.into() ,stete_in_mem: RwLock::new(tree) }, mountpoint, &config).unwrap();
 }
